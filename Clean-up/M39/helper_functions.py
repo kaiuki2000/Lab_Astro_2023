@@ -2,9 +2,14 @@ import os
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 from warnings import filterwarnings
 import astroalign as aa
 from astropy.io import fits
+from astropy.coordinates import SkyCoord
+from astroquery.gaia import Gaia         
+from astropy.wcs import WCS
+from astropy import units as u
 from astropy.visualization import simple_norm
 from astropy.modeling import models, fitting
 from astropy.modeling.models import Gaussian2D
@@ -15,7 +20,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from photutils.psf import PSFPhotometry, IterativePSFPhotometry, BasicPSFPhotometry, IterativelySubtractedPSFPhotometry, IntegratedGaussianPRF, SourceGrouper, prepare_psf_model, DAOGroup
 from astropy.table import Table, QTable
 
-def im_plot(data, title = 'Default title', cbar_label = 'Counts', cbar_flag = True, stars_found = None, cmap = 'RdPu', lo: float = 1.5, up: float = 98.5) -> None:
+def im_plot(data, title = 'Default title', cbar_label = 'Counts', cbar_flag = True, stars_found = None, \
+            cmap = 'RdPu', lo: float = 1.5, up: float = 98.5) -> None:
     """
     Plots an image with a colorbar and stars found if provided.
     
@@ -63,7 +69,8 @@ def im_plot(data, title = 'Default title', cbar_label = 'Counts', cbar_flag = Tr
 
 
 # Calibration functions
-def masterBiasCreator(bias_dir: str = "./", plot_flag: bool = False, save_dir: str = "./", silent: bool = False) -> np.ndarray:
+def masterBiasCreator(bias_dir: str = "./", plot_flag: bool = False, save_dir: str = "./", \
+                      silent: bool = False) -> np.ndarray:
     """
     Description:
         Creates a master bias frame from a set of bias frames.
@@ -586,6 +593,154 @@ mag_B = {Row2['mag']:.4f}, mag_G = {Row1['mag']:.4f}, B-V = {Row2['mag'] - Row1[
         plt.ylabel(f'{filters[0]}')
         plt.title(f'{object} Hertzsprung-Russell Diagram')
         plt.legend()
+        plt.savefig("H-R_Diagram_M39.png", dpi = 600)
         plt.show()
 
     return(BV_List, BV_err, V_err)
+
+
+
+def match_gaia(sources, header, ra, dec, width = 0.2, height = 0.2):
+    """
+    Description:
+        Function that matches the stars in the image with the Gaia catalog.
+    Parameters:
+        sources: array of the sources' coordinates in the image
+        header: header of the image
+        ra: right ascension of the center of the image
+        dec: declination of the center of the image
+        width: width of the image
+        height: height of the image
+    Returns:
+        star_ra: array of the right ascension of the stars in the image
+        star_dec: array of the declination of the stars in the image
+        star_par: array of the parallax of the stars in the image
+        star_parer: array of the parallax error of the stars in the image
+    """
+
+    Gaia.MAIN_GAIA_TABLE = "gaiaedr3.gaia_source" # edr3 or dr2
+    Gaia.ROW_LIMIT       = -1
+    
+    # Get ra,dec from WCS astrometry header
+    wcs_header = WCS(header)
+    coords     = wcs_header.pixel_to_world(sources[0], sources[1])
+
+    # Get Gaia catalog around center ra/dec values
+    cencoord      = SkyCoord(ra = ra, dec = dec, unit = (u.deg, u.deg), frame = 'icrs')
+    width, height = u.Quantity(width, u.deg), u.Quantity(height, u.deg)
+    gaia_stars    = Gaia.query_object_async(coordinate = cencoord, width = width, height = height)
+    gaia_coords   = SkyCoord(ra = gaia_stars['ra'], dec = gaia_stars['dec'])
+
+    # Match catalogs
+    gidx, gd2d, gd3d = coords.match_to_catalog_sky(gaia_coords)
+    gbestidx         = (gd2d.deg < 0.0008) #<0.00015deg=0.54''
+
+    # Output variables
+    star_ra, star_dec           = np.zeros(len(sources[0]), dtype = float), np.zeros(len(sources[0]), dtype = float)
+    star_ra[:], star_dec[:]     = np.nan, np.nan
+    star_ra[gbestidx]           = gaia_stars['ra'][gidx[gbestidx]]
+    star_dec[gbestidx]          = gaia_stars['dec'][gidx[gbestidx]]
+    
+    # Stars' distances
+    star_dist                   = np.zeros(len(sources[0]), dtype = float)
+    star_dist[:]                = np.nan
+    star_dist[gbestidx]         = gaia_stars['dist'][gidx[gbestidx]]
+
+    # Proper motions
+    star_pmra, star_pmdec       = np.zeros(len(sources[0]), dtype = float), np.zeros(len(sources[0]), dtype = float)
+    star_pmra[:], star_pmdec[:] = np.nan, np.nan
+    star_pmra[gbestidx]         = gaia_stars['pmra'][gidx[gbestidx]]
+    star_pmdec[gbestidx]        = gaia_stars['pmdec'][gidx[gbestidx]]
+
+    star_par, star_parer        = np.zeros(len(sources[0]), dtype = float) * np.nan, np.zeros(len(sources[0]), dtype = float) * np.nan
+    star_par[gbestidx]          = gaia_stars['parallax'][gidx[gbestidx]]
+    star_parer[gbestidx]        = gaia_stars['parallax_error'][gidx[gbestidx]]
+
+    return star_ra, star_dec, star_par, star_parer, star_dist, star_pmra, star_pmdec
+
+
+
+def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag = True, n_std = 1.0, \
+                       silent = False, xlim = None, ylim = None, filter = 'Red'):
+    """
+    Description:
+        Function that masks the stars that were not matched with the Gaia catalogue.
+        Also uses a confidence ellipse to mask further stars that are (probably) not part of the cluster.
+    Parameters:
+        astrometry_image: image with the astrometry
+        center: center of the image
+        table: table with the stars' data
+        plot_flag: if True, plots the results
+        n_std: number of standard deviations
+        silent: if True, does not print anything
+        xlim: x axis limits
+        ylim: y axis limits
+    Returns:
+        table_masked: table with the stars that were matched with the Gaia catalogue
+        table_unmasked: table with the stars that were not matched with the Gaia catalogue
+    """
+
+    # Running the matching function:
+    stars_found            = np.array((table['x_fit'], table['y_fit']))
+    header                 = astrometry_image.header
+    sources                = stars_found
+    ra, dec, width, height = center[0], center[1], 0.2, 0.2
+
+    star_ra, star_dec, _, _, _, star_pmra, star_pmdec = match_gaia(sources, header, ra, dec, width, height)
+
+    # Count number of matches
+    if(not silent): print(f'Number of matches with Gaia catalogue = {np.count_nonzero(~(np.isnan(star_ra) | np.isnan(star_dec)))}.')
+
+    # Masking the stars that were not matched with the Gaia catalogue.
+    pm_ra  = star_pmra[~(np.isnan(star_pmra) | np.isnan(star_pmdec))]
+    pm_dec = star_pmdec[~(np.isnan(star_pmra) | np.isnan(star_pmdec))]
+
+    plt.figure()
+    ax = plt.gca()
+
+    # Define your 'nσ-confidence-ellipse' parameters:
+    n_std      = n_std # Same as n_σ.
+    cov        = np.cov(pm_ra, pm_dec)
+    lambda_, v = np.linalg.eig(cov)
+    lambda_    = np.sqrt(lambda_)
+
+    ellipse_center_pmra  = np.mean(pm_ra)
+    ellipse_center_pmdec = np.mean(pm_dec)
+    major_axis           = lambda_[0]*2*n_std # 2a
+    minor_axis           = lambda_[1]*2*n_std # 2b
+    angle_deg            = np.rad2deg(np.arccos(v[0, 0]))
+    angle                = np.radians(angle_deg)
+
+    ellipse = Ellipse(xy = (ellipse_center_pmra, ellipse_center_pmdec), width = major_axis, height = minor_axis, 
+                            edgecolor = 'C3', fc = 'None', lw=0.5, angle = angle_deg, label = rf'Confidence ellipse (${n_std} \sigma$)')
+    ax.add_patch(ellipse)
+
+    # We only work with the stars that were matched with the Gaia catalogue.
+    mask = ~(np.isnan(star_pmra) | np.isnan(star_pmdec))
+    pm_ra  = star_pmra [mask]
+    pm_dec = star_pmdec[mask]
+
+    # Calculate the proper motion ellipse
+    ellipse = (( ( (pm_ra  - ellipse_center_pmra) * np.cos(angle) + (pm_dec - ellipse_center_pmdec)* np.sin(angle) )** 2  / (major_axis/2.)** 2 +
+                 ( (pm_ra  - ellipse_center_pmra) * np.sin(angle) - (pm_dec - ellipse_center_pmdec)* np.cos(angle) )** 2  / (minor_axis/2.)** 2 ) <= 1)
+
+    # Plotting the pmRA vs pmDEC graph:
+    masked_ra            = pm_ra[ellipse]
+    masked_dec           = pm_dec[ellipse]
+
+    # Plotting results.
+    if(plot_flag == True):
+        plt.plot(masked_ra, masked_dec, 'o', markersize = 1.0, label = 'Accepted data points')
+        plt.plot(pm_ra[~ellipse], pm_dec[~ellipse], 'o', markersize = 1.0, label = 'Rejected data points')
+        plt.title(rf'Gaia catalogue matching: Proper motions in RA ($\alpha$) vs DEC ($\delta$) [{filter} filter]')
+        if(xlim != None and ylim != None):
+            plt.xlim(xlim[0], xlim[1])
+            plt.ylim(ylim[0], ylim[1])
+        plt.xlabel(r'Proper motion $\alpha$ [mas/yr]')
+        plt.ylabel(r'Proper motion $\delta$ [mas/yr]')
+        plt.legend()
+        plt.show()
+
+    table_masked   = (table[mask])[ellipse]
+    table_unmasked = (table[mask])[~ellipse]
+    return table_masked, table_unmasked
