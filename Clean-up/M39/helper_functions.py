@@ -532,7 +532,7 @@ def CreateStarsTable(data: np.ndarray, iterative: bool = False, filter: str = 'R
 
 def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, \
                silent = False, plot_flag = True, object: str = 'M39', \
-               filters: tuple = ('B', 'V'), error_bars_flag = True) -> tuple:
+               filters: tuple = ('B', 'V'), error_bars_flag = True, par_flag = False) -> tuple:
     """
     Description:
         Generates a Herzsprung-Russell diagram from two tables of stars (from two different filters, B and V).
@@ -545,13 +545,17 @@ def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, \
         object (str): name of the object ('M39' by default).
         filters (tuple): tuple of strings with the names of the filters used.~
         error_bars_flag (bool): if True, plots error bars.
+        par_flag (bool): if True, outputs parallaxes as well.
     Outputs:
         BV_List (list): list of tuples (B-V, B) for each matched star. (Or other filters, e.g., V-R)
+        par_List (list): list of parallaxes for each matched star.
+        BV_err (list): list of errors in B-V for each matched star.
+        V_err (list): list of errors in V for each matched star.
     """
     
     # Star matching (for B-V computations) algorithm:
-    BV_List = []
-    BV_err, V_err  = [], []
+    BV_List, par_List = [], []
+    BV_err, V_err     = [], []
 
     for Row1 in green_table:
         for Row2 in blue_table:
@@ -560,6 +564,7 @@ def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, \
 abs(delta_x) = {abs(Row2['y_fit'] - Row1['y_fit']):.4f}, abs(delta_y) = {abs(Row2['y_fit'] - Row1['y_fit']):.4f}, \
 mag_B = {Row2['mag']:.4f}, mag_G = {Row1['mag']:.4f}, B-V = {Row2['mag'] - Row1['mag']:.4f}")
                 BV_List.append((Row2['mag'] - Row1['mag'], Row2['mag'])) # (B-V, B)
+                if(par_flag): par_List.append((Row1['parallax'] + Row2['parallax'])/2.)
                 if(error_bars_flag == True): 
                     BV_err.append(np.sqrt( Row2['mag_err']**2 + Row1['mag_err']**2 ))
                     V_err.append(Row1['mag_err'])
@@ -596,7 +601,7 @@ mag_B = {Row2['mag']:.4f}, mag_G = {Row1['mag']:.4f}, B-V = {Row2['mag'] - Row1[
         plt.savefig("H-R_Diagram_M39.png", dpi = 600)
         plt.show()
 
-    return(BV_List, BV_err, V_err)
+    return(BV_List, par_List, BV_err, V_err)
 
 
 
@@ -612,10 +617,14 @@ def match_gaia(sources, header, ra, dec, width = 0.2, height = 0.2):
         width: width of the image
         height: height of the image
     Returns:
-        star_ra: array of the right ascension of the stars in the image
-        star_dec: array of the declination of the stars in the image
-        star_par: array of the parallax of the stars in the image
-        star_parer: array of the parallax error of the stars in the image
+        star_ra: right ascension of the stars
+        star_dec: declination of the stars
+        star_par: parallax of the stars
+        star_parer: parallax error of the stars
+        star_dist: distance of the stars
+        star_pmra: proper motion in right ascension of the stars
+        star_pmdec: proper motion in declination of the stars
+        matched_stars: Gaia catalog around the center of the image (matched stars).
     """
 
     Gaia.MAIN_GAIA_TABLE = "gaiaedr3.gaia_source" # edr3 or dr2
@@ -652,11 +661,14 @@ def match_gaia(sources, header, ra, dec, width = 0.2, height = 0.2):
     star_pmra[gbestidx]         = gaia_stars['pmra'][gidx[gbestidx]]
     star_pmdec[gbestidx]        = gaia_stars['pmdec'][gidx[gbestidx]]
 
+    # Stars' parallaxes
     star_par, star_parer        = np.zeros(len(sources[0]), dtype = float) * np.nan, np.zeros(len(sources[0]), dtype = float) * np.nan
     star_par[gbestidx]          = gaia_stars['parallax'][gidx[gbestidx]]
     star_parer[gbestidx]        = gaia_stars['parallax_error'][gidx[gbestidx]]
 
-    return star_ra, star_dec, star_par, star_parer, star_dist, star_pmra, star_pmdec
+    matched_stars               = gaia_stars[gidx[gbestidx]]
+
+    return star_ra, star_dec, star_par, star_parer, star_dist, star_pmra, star_pmdec, matched_stars
 
 
 
@@ -686,7 +698,7 @@ def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag
     sources                = stars_found
     ra, dec, width, height = center[0], center[1], 0.2, 0.2
 
-    star_ra, star_dec, _, _, _, star_pmra, star_pmdec = match_gaia(sources, header, ra, dec, width, height)
+    star_ra, star_dec, star_par, _, _, star_pmra, star_pmdec, _ = match_gaia(sources, header, ra, dec, width, height)
 
     # Count number of matches
     if(not silent): print(f'Number of matches with Gaia catalogue = {np.count_nonzero(~(np.isnan(star_ra) | np.isnan(star_dec)))}.')
@@ -712,13 +724,15 @@ def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag
     angle                = np.radians(angle_deg)
 
     ellipse = Ellipse(xy = (ellipse_center_pmra, ellipse_center_pmdec), width = major_axis, height = minor_axis, 
-                            edgecolor = 'C3', fc = 'None', lw=0.5, angle = angle_deg, label = rf'Confidence ellipse (${n_std} \sigma$)')
+                            edgecolor = 'C3', fc = 'None', lw = 0.5, angle = angle_deg, \
+                            label = rf'Confidence ellipse (${n_std} \sigma$)')
     ax.add_patch(ellipse)
 
     # We only work with the stars that were matched with the Gaia catalogue.
-    mask = ~(np.isnan(star_pmra) | np.isnan(star_pmdec))
+    mask   = ~(np.isnan(star_pmra) | np.isnan(star_pmdec))
     pm_ra  = star_pmra [mask]
     pm_dec = star_pmdec[mask]
+    par    = star_par[mask] # Parallaxes! Needed for distance modulus.
 
     # Calculate the proper motion ellipse
     ellipse = (( ( (pm_ra  - ellipse_center_pmra) * np.cos(angle) + (pm_dec - ellipse_center_pmdec)* np.sin(angle) )** 2  / (major_axis/2.)** 2 +
@@ -727,6 +741,7 @@ def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag
     # Plotting the pmRA vs pmDEC graph:
     masked_ra            = pm_ra[ellipse]
     masked_dec           = pm_dec[ellipse]
+    masked_par           = par[ellipse] # Parallaxes! Needed for distance modulus.
 
     # Plotting results.
     if(plot_flag == True):
@@ -741,6 +756,9 @@ def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag
         plt.legend()
         plt.show()
 
-    table_masked   = (table[mask])[ellipse]
-    table_unmasked = (table[mask])[~ellipse]
+    table_masked               = (table[mask])[ellipse]
+    table_masked['parallax']   = masked_par
+
+    table_unmasked             = (table[mask])[~ellipse]
+    table_unmasked['parallax'] = par[~ellipse]
     return table_masked, table_unmasked
