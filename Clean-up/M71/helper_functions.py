@@ -1,9 +1,16 @@
 import os
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 from warnings import filterwarnings
 import astroalign as aa
 from astropy.io import fits
+from astropy.coordinates import SkyCoord
+from astroquery.gaia import Gaia         
+from astropy.wcs import WCS
+from astropy import units as u
+from astropy.visualization import simple_norm
 from astropy.modeling import models, fitting
 from astropy.modeling.models import Gaussian2D
 from astropy.stats import sigma_clipped_stats, gaussian_sigma_to_fwhm, SigmaClip
@@ -358,16 +365,13 @@ def CreateStarsTable(data: np.ndarray, iterative: bool = False, filter: str = 'R
     """
 
     # For M71:
-    z    = 1.07                        # Airmass
-    def sec(z): return 1.0 / np.cos(z) # sec(z) = 1/cos(z)
-    # m_zp = 0.0                       # Zero-point magnitude: introduce actual value later!
+    sec_z    = 1.07                    # Airmass
 
     # Extinction coefficient values
-    if(filter   == 'Red'):   k = 0.09; m_zp = 0.0 
-    elif(filter == 'Green'): k = 0.15; m_zp = 0.0
-    elif(filter == 'Blue'):  k = 0.25; m_zp = 0.0 
+    if(filter   == 'Red'):   k = 0.09; m_zp = 20.872; m_zp_err = 0.045 
+    elif(filter == 'Green'): k = 0.15; m_zp = 20.768; m_zp_err = 0.037
+    elif(filter == 'Blue'):  k = 0.25; m_zp = 19.831; m_zp_err = 0.028 
         
-
     # Get background
     sigma_clip = SigmaClip(sigma = 3.0)
     bkg_estimator = MMMBackground(sigma_clip = sigma_clip)
@@ -470,8 +474,10 @@ def CreateStarsTable(data: np.ndarray, iterative: bool = False, filter: str = 'R
         im_plot(data, title = f'Image with {len(phot)} stars found ({filter} filter)', cbar_label = 'Counts', cbar_flag = True, stars_found = phot, cmap = 'viridis')
 
     # Adding magnitude column to Table.
-    phot['mag'] = -2.5 * np.log10(phot['flux_fit']/exp_time) - k * sec(z) + m_zp # We're missing m_zp, from the standard star!
-
+    phot['mag'] = -2.5 * np.log10(phot['flux_fit']/exp_time) - k * sec_z + m_zp # We're missing m_zp, from the standard star!
+    if(model_2D == False): phot['mag_err'] = np.sqrt( (2.5 * 1/phot['flux_fit'] * 1/np.log(10) * phot['flux_err'])**2 + \
+                                (-k * 0.01)**2 + (-sec_z * 0.01)**2 + m_zp_err**2 )
+        
     # Print the table in ascending order of magnitudes, using sorted()
     # Different possible sorting criteria.
     def get_mag(Table):
@@ -485,7 +491,9 @@ def CreateStarsTable(data: np.ndarray, iterative: bool = False, filter: str = 'R
 
 
 
-def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, silent = False, plot_flag = True) -> tuple:
+def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, \
+               silent = False, plot_flag = True, object: str = 'M71', \
+               filters: tuple = ('B', 'V'), error_bars_flag = True, par_flag = False) -> tuple:
     """
     Description:
         Generates a Herzsprung-Russell diagram from two tables of stars (from two different filters, B and V).
@@ -495,12 +503,21 @@ def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, s
         match_dist (float): maximum distance between stars to be considered a match.
         silent (bool): if True, does not print anything.
         plot_flag (bool): if True, plots the resulting Herzsprung-Russell diagram.
+        object (str): name of the object ('M39' by default).
+        filters (tuple): tuple of strings with the names of the filters used.~
+        error_bars_flag (bool): if True, plots error bars.
+        par_flag (bool): if True, outputs parallaxes as well.
     Outputs:
-        BV_List (list): list of tuples (B-V, B) for each matched star.
+        BV_List (list): list of tuples (B-V, B) for each matched star. (Or other filters, e.g., V-R)
+        par_List (list): list of parallaxes for each matched star.
+        BV_err (list): list of errors in B-V for each matched star.
+        V_err (list): list of errors in V for each matched star.
     """
     
     # Star matching (for B-V computations) algorithm:
-    BV_List = []
+    BV_List, par_List = [], []
+    BV_err, V_err     = [], []
+
     for Row1 in green_table:
         for Row2 in blue_table:
             if(abs(Row2['x_fit'] - Row1['x_fit']) < match_dist and abs(Row2['y_fit'] - Row1['y_fit']) < match_dist):
@@ -508,18 +525,201 @@ def GenerateHR(blue_table: Table, green_table: Table, match_dist: float = 1.0, s
 abs(delta_x) = {abs(Row2['y_fit'] - Row1['y_fit']):.4f}, abs(delta_y) = {abs(Row2['y_fit'] - Row1['y_fit']):.4f}, \
 mag_B = {Row2['mag']:.4f}, mag_G = {Row1['mag']:.4f}, B-V = {Row2['mag'] - Row1['mag']:.4f}")
                 BV_List.append((Row2['mag'] - Row1['mag'], Row2['mag'])) # (B-V, B)
+                if(par_flag): par_List.append((Row1['parallax'] + Row2['parallax'])/2.)
+                if(error_bars_flag == True): 
+                    BV_err.append(np.sqrt( Row2['mag_err']**2 + Row1['mag_err']**2 ))
+                    V_err.append(Row1['mag_err'])
                 blue_table = blue_table[blue_table['id'] != Row2['id']]
                 continue
     print(f'{len(BV_List)} matches found.')
 
     # Plotting the resulting Herzsprung-Russell diagram
     if(plot_flag == True):
-        plt.scatter([x[0] for x in BV_List], [y[1] for y in BV_List], label = 'Data points')
+        def colorFader(c1, c2, mix = 0):    # Fade (linear interpolate) from color c1 (at mix = 0) to c2 (mix = 1)
+            c1 = np.array(mpl.colors.to_rgb(c1))
+            c2 = np.array(mpl.colors.to_rgb(c2))
+            return np.array([mpl.colors.to_hex((1 - mix[i]) * c1 + mix[i] * c2) for i in range(len(mix))])
+        
+        # Sigmoid scaling function
+        sigmoid = lambda x: 1 / (1 + np.exp(-x))
+        c1 = '#3266a8' # Blue
+        c2 = '#a85f32' # Orange
+
+        plt.scatter([x[0] for x in BV_List], [y[1] for y in BV_List], label = 'Data points', s = 5, \
+                    color = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in [x[0] for x in BV_List]])))
+        if(error_bars_flag == True):
+            plt.errorbar([x[0] for x in BV_List], [y[1] for y in BV_List], xerr = BV_err, yerr = V_err, fmt = 'none', \
+                          ecolor = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in [x[0] for x in BV_List]])), \
+                          elinewidth = 0.5)
+
         plt.gca().invert_yaxis()
-        plt.ylabel('B')
-        plt.xlabel('B-V')
-        plt.title('Hertzsprung-Russell Diagram')
+        plt.xlim(-2.0, 2.0)      # This is here for easier comparison with the literature.
+        plt.ylim(20, 6)          # Same for this.
+        plt.xlabel(f'{filters[0]} - {filters[1]}')
+        plt.ylabel(f'{filters[0]}')
+        plt.title(f'{object} Hertzsprung-Russell Diagram')
+        plt.legend()
+        plt.savefig("H-R_Diagram_M39.png", dpi = 600)
+        plt.show()
+
+    return(BV_List, par_List, BV_err, V_err)
+
+
+
+def match_gaia(sources, header, ra, dec, width = 0.2, height = 0.2):
+    """
+    Description:
+        Function that matches the stars in the image with the Gaia catalog.
+    Parameters:
+        sources: array of the sources' coordinates in the image
+        header: header of the image
+        ra: right ascension of the center of the image
+        dec: declination of the center of the image
+        width: width of the image
+        height: height of the image
+    Returns:
+        star_ra: right ascension of the stars
+        star_dec: declination of the stars
+        star_par: parallax of the stars
+        star_parer: parallax error of the stars
+        star_dist: distance of the stars
+        star_pmra: proper motion in right ascension of the stars
+        star_pmdec: proper motion in declination of the stars
+        matched_stars: Gaia catalog around the center of the image (matched stars).
+    """
+
+    Gaia.MAIN_GAIA_TABLE = "gaiaedr3.gaia_source" # edr3 or dr2
+    Gaia.ROW_LIMIT       = -1
+    
+    # Get ra,dec from WCS astrometry header
+    wcs_header = WCS(header)
+    coords     = wcs_header.pixel_to_world(sources[0], sources[1])
+
+    # Get Gaia catalog around center ra/dec values
+    cencoord      = SkyCoord(ra = ra, dec = dec, unit = (u.deg, u.deg), frame = 'icrs')
+    width, height = u.Quantity(width, u.deg), u.Quantity(height, u.deg)
+    gaia_stars    = Gaia.query_object_async(coordinate = cencoord, width = width, height = height)
+    gaia_coords   = SkyCoord(ra = gaia_stars['ra'], dec = gaia_stars['dec'])
+
+    # Match catalogs
+    gidx, gd2d, gd3d = coords.match_to_catalog_sky(gaia_coords)
+    gbestidx         = (gd2d.deg < 0.0008) #<0.00015deg=0.54''
+
+    # Output variables
+    star_ra, star_dec           = np.zeros(len(sources[0]), dtype = float), np.zeros(len(sources[0]), dtype = float)
+    star_ra[:], star_dec[:]     = np.nan, np.nan
+    star_ra[gbestidx]           = gaia_stars['ra'][gidx[gbestidx]]
+    star_dec[gbestidx]          = gaia_stars['dec'][gidx[gbestidx]]
+    
+    # Stars' distances
+    star_dist                   = np.zeros(len(sources[0]), dtype = float)
+    star_dist[:]                = np.nan
+    star_dist[gbestidx]         = gaia_stars['dist'][gidx[gbestidx]]
+
+    # Proper motions
+    star_pmra, star_pmdec       = np.zeros(len(sources[0]), dtype = float), np.zeros(len(sources[0]), dtype = float)
+    star_pmra[:], star_pmdec[:] = np.nan, np.nan
+    star_pmra[gbestidx]         = gaia_stars['pmra'][gidx[gbestidx]]
+    star_pmdec[gbestidx]        = gaia_stars['pmdec'][gidx[gbestidx]]
+
+    # Stars' parallaxes
+    star_par, star_parer        = np.zeros(len(sources[0]), dtype = float) * np.nan, np.zeros(len(sources[0]), dtype = float) * np.nan
+    star_par[gbestidx]          = gaia_stars['parallax'][gidx[gbestidx]]
+    star_parer[gbestidx]        = gaia_stars['parallax_error'][gidx[gbestidx]]
+
+    matched_stars               = gaia_stars[gidx[gbestidx]]
+
+    return star_ra, star_dec, star_par, star_parer, star_dist, star_pmra, star_pmdec, matched_stars
+
+
+
+def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag = True, n_std = 1.0, \
+                       silent = False, xlim = None, ylim = None, filter = 'Red'):
+    """
+    Description:
+        Function that masks the stars that were not matched with the Gaia catalogue.
+        Also uses a confidence ellipse to mask further stars that are (probably) not part of the cluster.
+    Parameters:
+        astrometry_image: image with the astrometry
+        center: center of the image
+        table: table with the stars' data
+        plot_flag: if True, plots the results
+        n_std: number of standard deviations
+        silent: if True, does not print anything
+        xlim: x axis limits
+        ylim: y axis limits
+    Returns:
+        table_masked: table with the stars that were matched with the Gaia catalogue
+        table_unmasked: table with the stars that were not matched with the Gaia catalogue
+    """
+
+    # Running the matching function:
+    stars_found            = np.array((table['x_fit'], table['y_fit']))
+    header                 = astrometry_image.header
+    sources                = stars_found
+    ra, dec, width, height = center[0], center[1], 0.2, 0.2
+
+    star_ra, star_dec, star_par, _, _, star_pmra, star_pmdec, _ = match_gaia(sources, header, ra, dec, width, height)
+
+    # Count number of matches
+    if(not silent): print(f'Number of matches with Gaia catalogue = {np.count_nonzero(~(np.isnan(star_ra) | np.isnan(star_dec)))}.')
+
+    # Masking the stars that were not matched with the Gaia catalogue.
+    pm_ra  = star_pmra[~(np.isnan(star_pmra) | np.isnan(star_pmdec))]
+    pm_dec = star_pmdec[~(np.isnan(star_pmra) | np.isnan(star_pmdec))]
+
+    plt.figure()
+    ax = plt.gca()
+
+    # Define your 'nσ-confidence-ellipse' parameters:
+    n_std      = n_std # Same as n_σ.
+    cov        = np.cov(pm_ra, pm_dec)
+    lambda_, v = np.linalg.eig(cov)
+    lambda_    = np.sqrt(lambda_)
+
+    ellipse_center_pmra  = np.mean(pm_ra)
+    ellipse_center_pmdec = np.mean(pm_dec)
+    major_axis           = lambda_[0]*2*n_std # 2a
+    minor_axis           = lambda_[1]*2*n_std # 2b
+    angle_deg            = np.rad2deg(np.arccos(v[0, 0]))
+    angle                = np.radians(angle_deg)
+
+    ellipse = Ellipse(xy = (ellipse_center_pmra, ellipse_center_pmdec), width = major_axis, height = minor_axis, 
+                            edgecolor = 'C3', fc = 'None', lw = 0.5, angle = angle_deg, \
+                            label = rf'Confidence ellipse (${n_std} \sigma$)')
+    ax.add_patch(ellipse)
+
+    # We only work with the stars that were matched with the Gaia catalogue.
+    mask   = ~(np.isnan(star_pmra) | np.isnan(star_pmdec))
+    pm_ra  = star_pmra [mask]
+    pm_dec = star_pmdec[mask]
+    par    = star_par[mask] # Parallaxes! Needed for distance modulus.
+
+    # Calculate the proper motion ellipse
+    ellipse = (( ( (pm_ra  - ellipse_center_pmra) * np.cos(angle) + (pm_dec - ellipse_center_pmdec)* np.sin(angle) )** 2  / (major_axis/2.)** 2 +
+                 ( (pm_ra  - ellipse_center_pmra) * np.sin(angle) - (pm_dec - ellipse_center_pmdec)* np.cos(angle) )** 2  / (minor_axis/2.)** 2 ) <= 1)
+
+    # Plotting the pmRA vs pmDEC graph:
+    masked_ra            = pm_ra[ellipse]
+    masked_dec           = pm_dec[ellipse]
+    masked_par           = par[ellipse] # Parallaxes! Needed for distance modulus.
+
+    # Plotting results.
+    if(plot_flag == True):
+        plt.plot(masked_ra, masked_dec, 'o', markersize = 1.0, label = 'Accepted data points')
+        plt.plot(pm_ra[~ellipse], pm_dec[~ellipse], 'o', markersize = 1.0, label = 'Rejected data points')
+        plt.title(rf'Gaia catalogue matching: Proper motions in RA ($\alpha$) vs DEC ($\delta$) [{filter} filter]')
+        if(xlim != None and ylim != None):
+            plt.xlim(xlim[0], xlim[1])
+            plt.ylim(ylim[0], ylim[1])
+        plt.xlabel(r'Proper motion $\alpha$ [mas/yr]')
+        plt.ylabel(r'Proper motion $\delta$ [mas/yr]')
         plt.legend()
         plt.show()
 
-    return(BV_List)
+    table_masked               = (table[mask])[ellipse]
+    table_masked['parallax']   = masked_par
+
+    table_unmasked             = (table[mask])[~ellipse]
+    table_unmasked['parallax'] = par[~ellipse]
+    return table_masked, table_unmasked
