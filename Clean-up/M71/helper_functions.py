@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
+from matplotlib.colors import LogNorm
 from warnings import filterwarnings
 import astroalign as aa
 from astropy.io import fits
@@ -19,6 +20,7 @@ from photutils.background import Background2D, MMMBackground # Can also use 'Med
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from photutils.psf import PSFPhotometry, IterativePSFPhotometry, BasicPSFPhotometry, IterativelySubtractedPSFPhotometry, IntegratedGaussianPRF, SourceGrouper, prepare_psf_model, DAOGroup
 from astropy.table import Table, QTable
+from shapely.geometry import LineString, Point
 
 def im_plot(data, title = 'Default title', cbar_label = 'Counts', cbar_flag = True, stars_found = None, cmap = 'RdPu', lo: float = 1.5, up: float = 98.5) -> None:
     """
@@ -723,3 +725,260 @@ def GaiaEllipseMask_pm(astrometry_image, center: tuple, table: QTable, plot_flag
     table_unmasked             = (table[mask])[~ellipse]
     table_unmasked['parallax'] = par[~ellipse]
     return table_masked, table_unmasked
+
+
+
+def isochrone_fitter(iso_file: str, data_x, data_y, data_x_err, data_y_err, \
+                     dists: tuple = (600, 8000, 200), N: int = 150, \
+                     mags: tuple = ('B', 'V'), object: str = 'M71', \
+                     mag_lims: tuple = (21, 2), silent: bool = True, \
+                     globular_method: bool = False, old_flag: bool = False) -> None:
+    """
+    Description
+    -----------
+    This function fits an isochrone to a given cluster, using the data from the HR diagram.
+    It uses the data from the Gaia catalogue, and the isochrones from the PARSEC database.
+    The isochrones are given in absolute magnitudes, while the data come in apparent.
+    The function returns the distance modulus and the distance in parsecs.
+
+    Parameters
+    ----------
+    iso_file : str
+        The name of the file containing the isochrones.
+    data_x : array-like
+        The x-axis data, in this case the color of the stars.
+    data_y : array-like
+        The y-axis data, in this case the magnitude of the stars.
+    data_x_err : array-like
+        The error in the x-axis data.
+    data_y_err : array-like
+        The error in the y-axis data.
+    dists : tuple, optional
+        The minimum and maximum distance to be tested, and the step size.
+        The default is (600, 8000, 200).
+    N : int, optional
+        The number of points to be used in the isochrone.
+        The default is 150.
+    mags : tuple, optional
+        The magnitudes to be used in the isochrone.
+        The default is ('B', 'V').
+    object : str, optional
+        The name of the cluster.
+        The default is 'M71'.
+    mag_lims : tuple, optional
+        The limits of the y-axis.
+        The default is (21, 2).
+    silent : bool, optional
+        If True, the function will not print anything.
+        The default is True.
+    globular_method : bool, optional
+        If True, the function will use the globular cluster method.
+        The default is False.
+    old_flag : bool, optional
+        If True, the function will only use 'old' ages.
+        The default is False.
+    
+    Returns
+    -------
+    None.
+    """
+
+    # Coloring scheme: Aesthetics only.
+    # Sigmoid scaling function
+    def colorFader(c1, c2, mix = 0):    # Fade (linear interpolate) from color c1 (at mix = 0) to c2 (mix = 1)
+        c1 = np.array(mpl.colors.to_rgb(c1))
+        c2 = np.array(mpl.colors.to_rgb(c2))
+        return np.array([mpl.colors.to_hex((1 - mix[i]) * c1 + mix[i] * c2) for i in range(len(mix))])
+
+    sigmoid = lambda x: 1 / (1 + np.exp(-x))
+    c1 = '#3266a8' # Blue
+    c2 = '#a85f32' # Orange
+    
+    # Read the models
+    # Important: Open the model file (in any text editor) and remove the # at the beginning of the line 12 (names of the columns)
+    # Otherwise python won't know the column names and will call them col1, col2 etc.
+    isochrones = Table.read(iso_file, format='ascii', guess = False, fast_reader = False)
+    if(not silent): print(isochrones.columns)
+
+    # Let's see which ages we have in the model file
+    logages = np.unique(isochrones['logAge'])         # Find the unique age entries
+    ages    = np.unique(10**isochrones['logAge']/1e6) # in Myrs
+    for logage, age in zip(logages,ages):
+        if(not silent): print(f'Log_Age = {logage:.5f}, Age = {age:.5f} Myrs.') # print all of that
+
+    # All the ages that we will test
+    ages = np.unique(isochrones['logAge'])
+
+    # Distance
+    dmin, dmax, step = dists[0], dists[1], dists[2]
+    distances        = np.arange(dmin, dmax, step) 
+
+    if(globular_method == False):
+        # Define an array to save the root-mean-square deviation values
+        rmsd = np.zeros(shape = (len(ages), len(distances)))
+        for i in range(len(ages)):
+            age = ages[i]
+            for j in range(len(distances)):
+
+                # Model
+                distance  = distances[j]
+                DM        = 5 * np.log10(distance) - 5                   # Distance modulus
+                isochrone = isochrones[isochrones['logAge'] == age][0:N]
+                col_iso   = isochrone[f'{mags[0]}mag'] - isochrone[f'{mags[1]}mag']        # Color isochrone
+                mag_iso   = isochrone[f'{mags[0]}mag'] + DM                       # Magnitude isochrone, shifted to the distance of the cluster
+                line      = LineString(np.asarray([col_iso, mag_iso]).T) # Representation of the isochrone as a continuous line 
+
+                # Data
+                d = np.empty(len(data_x))
+                for k in range(len(data_x)):
+                    col_data = data_x[k]
+                    mag_data = data_y[k]
+                    point    = Point(col_data, mag_data)
+                    d[k] = point.distance(line) # Shortest distance of the point to the line of the isochrone
+                d = np.ma.masked_invalid(d)
+                rmsd[i, j] = np.sqrt(np.nanmean(d**2)) 
+
+        fig, ax = plt.subplots(nrows = 1, ncols = 2, figsize = (14, 7))
+        fig.suptitle(f'{object} - Isochrone fit', fontsize = 16)
+        fig.subplots_adjust(top = 0.925)
+        fig.subplots_adjust(wspace = 0.1)
+
+        pos     = ax[0].imshow(rmsd, cmap = 'PiYG', norm = LogNorm(), origin = 'lower',
+                               extent = [distances[0], distances[-1], 10**ages[0]/1e6, 10**ages[-1]/1e6], aspect = 'auto', \
+                               interpolation = 'gaussian')
+        fig.colorbar(pos, ax = ax[0]) # , format = "%d")
+
+        # Find the grid position of the minimum rmsd
+        minrmsd_pos = np.unravel_index(rmsd.argmin(), rmsd.shape)
+        print(f'Best find indices: [i, j] = [{minrmsd_pos[0]}, {minrmsd_pos[1]}]. Rmsd = {np.nanmin(rmsd)}.')
+        print("Best fit model:    age =", np.round(10**ages[minrmsd_pos[0]]/1e6),'Myr; distance =', distances[minrmsd_pos[1]], 'pc.')
+        if(object == 'M71'): print("Literature values: age = 9-10 Gyr; distance = 4000 pc.")
+        if(object == 'M39'): print("Literature values: age = 278.6 Myr; distance = 311 pc.")
+        best_age  = ages[minrmsd_pos[0]]
+        best_dist = distances[minrmsd_pos[1]]
+        ax[0].set_xlabel('Distance in pc', fontsize = 15)
+        ax[0].set_ylabel('Age in Myr', fontsize = 15)
+
+        # Let's now plot the best-fit model on top of our data
+        ax[1].scatter( data_x, data_y, s = 2.5, \
+                       color = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in data_x])), label = 'Data points')
+        ax[1].errorbar(data_x, data_y, xerr = data_x_err, yerr = data_y_err, fmt = 'none', \
+                     ecolor = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in data_x])), \
+                     elinewidth = 0.5)
+        ax[1].set_ylim(mag_lims[0], mag_lims[1])
+        ax[1].set_xlabel(f'{mags[0]} - {mags[1]}', fontsize = 14)
+        ax[1].set_ylabel(f'{mags[0]}', fontsize = 14)
+
+        # Important: isochrones are given in absolute magnitudes, while the data come in apparent
+        # median_parallax = np.nanmedian(par_List)
+        DM = 5 * np.log10(best_dist) - 5        # Distance modulus
+
+        age_1 = isochrones['logAge'] == best_age
+        ax[1].plot(isochrones[f'{mags[0]}mag'][age_1][0:N] - isochrones[f'{mags[1]}mag'][age_1][0:N], isochrones[f'{mags[0]}mag'][age_1][0:N] + DM, \
+                 label = str(np.round(10**best_age/1e6)) + ' Myr', color = 'C4', linewidth = 1.0)
+        ax[1].legend()
+        plt.tight_layout()
+        plt.show()
+
+        print(f'Distance modulus: {DM:.5f}')
+        print(f'Distance in pc:   {best_dist:.3f}') # Distance in parsecs
+    else:
+        bin_size              = 0.1
+        min_edge_x,max_edge_x = -1.5 , 1.5
+        min_edge_y,max_edge_y = 7.5 , 17.5
+        bin_num_x             = int((max_edge_x-min_edge_x) / bin_size)
+        bin_num_y             = int((max_edge_y-min_edge_y) / bin_size)
+        bins_x                = np.linspace(min_edge_x, max_edge_x, bin_num_x + 1)
+        bins_y                = np.linspace(min_edge_y, max_edge_y, bin_num_y + 1)
+
+        col_data = data_x
+        mag_data = data_y
+
+        h2d, xedges, yedges   = np.histogram2d(mag_data, col_data, bins = (bins_y, bins_x))
+        fig, ax               = plt.subplots(nrows = 1, ncols = 3, width_ratios = [1, 2.5, 2.5], figsize = (16.8, 7))
+        fig.suptitle(f'{object} - Isochrone fit: Using \"Globular\" method', fontsize = 16)
+        fig.subplots_adjust(top = 0.925)
+        fig.subplots_adjust(wspace = 0.1)
+        
+        ax[0].imshow(h2d, norm   = LogNorm(vmin = 0.01, vmax = 100), extent = [min_edge_x, max_edge_x, min_edge_y, max_edge_y], \
+                  origin = 'lower')
+        ax[0].invert_yaxis()
+        ax[0].set_xlabel(f'{mags[0]} - {mags[1]}'), ax[0].set_ylabel(f'{mags[0]}')
+        ax[0].set_title('2D Histogram of the data')
+        # 'bins_x' and 'bins_y' are the edegs of the histogram bins
+        x = (bins_x + bin_size / 2)[0:-1]
+
+        # Actual 'fitting' starts here.
+        if(old_flag == True): ages = ages[ages >= 10] # Selecting only 'old' ages.
+        
+        # Values of the histogram for the fitting
+        x      = (bins_x + bin_size/2)[0:-1] # colors
+        y      = (bins_y + bin_size/2)[0:-1] # magnitudes
+        weight = h2d
+
+        # Define an array to save the root-mean-square deviation values
+        rmsd = np.zeros(shape = (len(ages), len(distances)))
+        for i in range(len(ages)):
+            age = ages[i]
+            for j in range(len(distances)):
+                distance = distances[j]
+                DM = 5 * np.log10(distance) - 5 # distance modulus
+                isochrone = isochrones[isochrones['logAge'] == age][0:N]
+                col_iso   = isochrone[f'{mags[0]}mag'] - isochrone[f'{mags[1]}mag'] # Color isochrone
+                mag_iso   = isochrone[f'{mags[0]}mag'] + DM                         # Magnitude isochrone, shifted to the distance of the cluster
+                line      = LineString(np.asarray([col_iso,mag_iso]).T) # Representation of the isochrone as a continuous line 
+
+                d     = np.empty(len(x)*len(y))
+                w     = np.empty(len(x)*len(y))
+                count = 0
+                for k_x in range(len(x)):
+                    for k_y in range(len(y)):
+                        col_data = x[k_x]
+                        mag_data = y[k_y]
+
+                        point    = Point(col_data, mag_data)
+                        d[count] = point.distance(line) # Shortest distance of the point to the isochrone
+                        w[count] = weight[k_y,k_x]
+                        count    = count + 1
+
+                rmsd[i, j] = np.sqrt(np.average(d**2, weights = w)) 
+
+        pos = ax[1].imshow(rmsd, cmap = 'PiYG', norm = LogNorm(), origin = 'lower', \
+                           extent = [distances[0], distances[-1], 10**ages[0]/1e6, 10**ages[-1]/1e6], aspect = 'auto')
+        fig.colorbar(pos, ax = ax[1]) # , format= "%d")
+
+        # Find the grid position of the minimum rmsd
+        minrmsd_pos = np.unravel_index(rmsd.argmin(), rmsd.shape)
+        print(np.nanmin(rmsd), minrmsd_pos)
+        print(f'Best find indices: [i, j] = [{minrmsd_pos[0]}, {minrmsd_pos[1]}]. Rmsd = {np.nanmin(rmsd)}.')
+        print("Best fit model:    age =", np.round(10**ages[minrmsd_pos[0]]/1e6),'Myr; distance =', distances[minrmsd_pos[1]], 'pc.')
+        if(object == 'M71'): print("Literature values: age = 9-10 Gyr; distance = 4000 pc.")
+        if(object == 'M39'): print("Literature values: age = 278.6 Myr; distance = 311 pc.")
+        best_age  = ages[minrmsd_pos[0]]
+        best_dist = distances[minrmsd_pos[1]]
+        ax[1].set_xlabel('Distance in pc', fontsize = 15)
+        ax[1].set_ylabel('Age in Myr', fontsize = 15)
+
+        # Let's now plot the best-fit model on top of our data
+        ax[2].scatter( data_x, data_y, s = 2.5, \
+                       color = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in data_x])), label = 'Data points')
+        ax[2].errorbar(data_x, data_y, xerr = data_x_err, yerr = data_y_err, fmt = 'none', \
+                     ecolor = colorFader(c1, c2, np.array([sigmoid(x*2.5) for x in data_x])), \
+                     elinewidth = 0.5)
+        ax[2].set_ylim(mag_lims[0], mag_lims[1])
+        ax[2].set_xlabel(f'{mags[0]} - {mags[1]}', fontsize = 14)
+        ax[2].set_ylabel(f'{mags[0]}', fontsize = 14)
+
+        # Important: isochrones are given in absolute magnitudes, while the data come in apparent
+        # median_parallax = np.nanmedian(par_List)
+        DM = 5 * np.log10(best_dist) - 5        # Distance modulus
+
+        age_1 = isochrones['logAge'] == best_age
+        ax[2].plot(isochrones[f'{mags[0]}mag'][age_1][0:N] - isochrones[f'{mags[1]}mag'][age_1][0:N], isochrones[f'{mags[0]}mag'][age_1][0:N] + DM, \
+                 label = str(np.round(10**best_age/1e6)) + ' Myr', color = 'C4', linewidth = 1.0)
+        ax[2].legend()
+        plt.tight_layout()
+        plt.show()
+
+        print(f'Distance modulus: {DM:.5f}')
+        print(f'Distance in pc:   {best_dist:.3f}') # Distance in parsecs
